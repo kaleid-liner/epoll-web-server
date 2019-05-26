@@ -4,7 +4,7 @@ A simple yet high performance web server written with epoll and pure c.
 
 ## Compile
 
-Type in folder [/files](./files)
+Type in folder [/src](./src)
 
 ```bash
 make
