@@ -15,6 +15,12 @@ typedef enum STATUS {
     NF    // Not Found
 } status_t;
 
+typedef enum REQUEST_STATUS {
+    Reading,
+    Writing,
+    Ended
+} req_status_t;
+
 typedef struct RequestInfo {
     int connfd; // connection file descriptor
 
@@ -29,17 +35,20 @@ const char *content_200 = "Hello from OSH web server";
 
 void send_file_response(int connfd, FILE *file);
 void send_response(int connfd, status_t status, const char *content, size_t content_length);
-void handle_request(const request_t *req);
+FILE *handle_request(const request_t *req);
 int parse_request(const char *req_str, request_t *req_info);
 
 typedef struct HttpStatus {
     int connfd;
     char *header;
     size_t readn;
+    FILE *file;
+    size_t left;
+    req_status_t req_status;
 } http_status_t;
 
 // 0 if not end, 1 if end response
-int server(http_status_t *status);
+void server(http_status_t *status);
 
 struct thread_args {
     int listenfd;

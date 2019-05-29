@@ -4,7 +4,7 @@ A simple yet high performance web server written with epoll and pure c.
 
 ## Compile
 
-Type in folder [/src](./src)
+Type in folder [/files](./files)
 
 ```bash
 make
@@ -45,14 +45,29 @@ Concurrency of this web server was implemented by using thread pool (Posix threa
           int connfd;     // connection file descriptor
           char *header;   // http header read, malloced with `MAX_HEADER` size
           size_t readn;   // number of bytes read
+          FILE *file;     // file to send
+          size_t left;    // number of bytes left to send
+          req_status_t req_status; 
       } http_status_t;
+      ```
+
+      While `req_status_t` is defined as:
+
+      ```c
+      typedef enum REQUEST_STATUS {
+          Reading,
+          Writing,
+          Ended
+      } req_status_t;
       ```
 
       Next time when `epoll_wait` get events on this fd, the server will continue on the request.
 
+   3. After complete reading, connfd will enter status `Writing`. If `sendfile` cause `EAGAIN`, and `left > 0` , it means that writing end is temporily unavailable. I have to save the status, `EPOLL_CTL_MOD` to change its trigger events to `EPOLLOUT | EPOLLET`. And continue the writing next time. 
+
 ### Notice
 
-- While calling `read` on a nonblocking descriptor, only when you get a `-1` return value and `errno == EAGAIN || errno == EWOULDBLOCK` (no data left) or a `0` return value (EOF detected), it means that the reading is done.
+- While calling `read` or `sendfile` on a nonblocking descriptor, only when you get a `-1` return value and `errno == EAGAIN || errno == EWOULDBLOCK` (no data left) or a `0` return value (EOF detected), it means that the reading is done.
 
   You may get a `0` return value when:
 
@@ -65,6 +80,10 @@ Concurrency of this web server was implemented by using thread pool (Posix threa
   *Why I share an epoll instance among threads:* Because this is more performant. And `epoll_wait` is generally thread-safe. ET also overperfoms LT.
 
 - `epoll_data_t.data` is a union. Its `ptr` field is designed to store session state. You should malloc status when needed and assign it to the `ptr`, and free it after you have done responding to it.
+
+- Notice that writing to connfd (by calling `sendfile`) is also non-blocking.
+
+- **USE EPOLLONESHOT** in multithreaded environment.
 
 ## Features
 

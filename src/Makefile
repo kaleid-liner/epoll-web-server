@@ -11,7 +11,7 @@ $(TARGET): $(OBJS)
 	$(CC) -o $@ $^ $(CFLAGS) $(LDFLAGS)
 
 $(OBJS): %.o: $(SRCDIR)/%.c $(SRCDEPS)
-	$(CC) -g -c -o $@ $(CFLAGS) $<
+	$(CC) -c -o $@ $(CFLAGS) $<
 
 .PHONY: clean
 clean:

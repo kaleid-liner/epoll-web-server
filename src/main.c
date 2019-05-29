@@ -10,6 +10,7 @@
 #include <sys/epoll.h>
 #include <fcntl.h>
 #include <signal.h>
+#include <sys/sendfile.h>
 #include "netutils.h"
 #include "main.h"
 
@@ -24,10 +25,10 @@ int parse_request(const char *req_str, request_t *req_info) {
     }
 }
 
-void handle_request(const request_t *req) {
+FILE *handle_request(const request_t *req) {
     if (strncmp(req->method, "GET", 3) != 0) {
         fprintf(stderr, "only support `GET` method\n");
-        return;
+        return NULL;
     }
 
     char *abs_path = (char *)malloc(PATH_MAX);
@@ -45,7 +46,7 @@ void handle_request(const request_t *req) {
 
     if (strncmp(cur_dir, abs_path, strlen(cur_dir)) != 0) {
         send_response(req->connfd, ISE, content_500, strlen(content_500));
-        return;
+        return NULL;
     } 
 
     FILE *file = fopen(abs_path, "rb");
@@ -57,11 +58,10 @@ void handle_request(const request_t *req) {
         } else {
             send_response(req->connfd, ISE, content_500, strlen(content_500));
         }
-        return;
+        return NULL;
     }
 
-    send_file_response(req->connfd, file);
-    fclose(file);
+    return file;
 }
 
 void send_response(int connfd, status_t status, 
@@ -93,84 +93,132 @@ void send_file_response(int connfd, FILE *file) {
     fseek(file, 0L, SEEK_END);
     __off_t file_size = ftell(file);
     fseek(file, 0L, SEEK_SET);
-    if (file_size < 0) file_size = LONG_MAX;
     
     char header[64];
-    char *buf = (char *)malloc(min(BUF_SIZE, file_size));
-    if (buf == NULL) {
-        perror("malloc");
-    }
     sprintf(header, "HTTP/1.0 200 OK\r\nContent-Length: %ld\r\n\r\n", file_size);
     rio_writen(connfd, header, strlen(header));
 
     size_t readn;
-    while ((readn = fread(buf, 1, BUF_SIZE, file)) > 0) {
-        rio_writen(connfd, buf, readn);
-    }
 
-    free(buf);
+    int filefd = fileno(file);
+    ssize_t left = file_size;
+    ssize_t writen;
+    while (left > 0) {
+        writen = sendfile(connfd, filefd, NULL, left);
+        if (writen < 0) {
+            if (errno == EAGAIN || errno == EWOULDBLOCK)
+                continue;
+            perror("sendfile");
+            break;
+        }
+        left -= writen;
+    }
 }
 
-int server(http_status_t *status) {
+void server(http_status_t *status) {
     int connfd = status->connfd;
     char *header = status->header;
     size_t readn = status->readn;
 
-    int is_end = 0;
+    if (status->req_status == Reading) {
+        int is_end = 0;
 
-    while (1) {
-        ssize_t ret = read(connfd, header + readn, 1);
-        if (readn >= MAX_HEADER) {
-            // entity too large
-            free(header);
-            free(status);
-            send_response(connfd, ISE, content_500, sizeof(content_500));
-            close(connfd);
-            break;
-        }
-        if (ret < 0) {
-            if (errno == EAGAIN || errno == EWOULDBLOCK) {
-                // read end normally
+        while (1) {
+            ssize_t ret = read(connfd, header + readn, 1);
+            if (readn >= MAX_HEADER) {
+                // entity too large
+                status->req_status = Ended;
+                send_response(connfd, ISE, content_500, sizeof(content_500));
+                return;
+            }
+            if (ret < 0) {
+                if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                    // read end normally
+                    break;
+                } else {
+                    perror("read");
+                    break;
+                }
+            } else if (ret == 0) {
+                // EOF encountered
                 break;
             } else {
-                perror("read");
-                break;
+                readn++;
+                if ( readn >= 4
+                && header[readn - 1] == '\n'
+                && header[readn - 2] == '\r'
+                && header[readn - 3] == '\n'
+                && header[readn - 4] == '\r' ) {
+                    is_end = 1;
+                    break;
+                }
             }
-        } else if (ret == 0) {
-            // EOF encountered
-            break;
+        }
+
+        if (!is_end) {
+            status->readn = readn;
+            return;
+        }
+
+        request_t req_info;
+        if (parse_request(header, &req_info) < 0) {
+            send_response(connfd, ISE, content_500, strlen(content_500));
+            status->req_status = Ended;
+            return;
+        }
+
+        req_info.connfd = connfd;
+        FILE *file = handle_request(&req_info);
+
+        fseek(file, 0L, SEEK_END);
+        __off_t file_size = ftell(file);
+        fseek(file, 0L, SEEK_SET);
+
+        if (file != NULL) {
+            char resp_header[64];
+            sprintf(resp_header, "HTTP/1.0 200 OK\r\nContent-Length: %ld\r\n\r\n", file_size);
+            rio_writen(connfd, resp_header, strlen(resp_header));
+            status->file = file;
+            status->left = file_size;
+            status->req_status = Writing;
         } else {
-            readn++;
-            if ( readn >= 4
-              && header[readn - 1] == '\n'
-              && header[readn - 2] == '\r'
-              && header[readn - 3] == '\n'
-              && header[readn - 4] == '\r' ) {
-                is_end = 1;
-                break;
-            }
+            status->req_status = Ended;
+            return;
         }
     }
 
-    if (!is_end) {
-        status->readn = readn;
-        return 0;
+    if (status->req_status == Writing) {
+        FILE *file = status->file;
+        int filefd = fileno(file);
+        size_t left = status->left;
+        ssize_t writen;
+
+        while (left > 0) {
+            writen = sendfile(connfd, filefd, NULL, left);
+            if (writen < 0) {
+                if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                    // read end normally
+                    break;
+                } else {
+                    perror("sendfile");
+                    status->req_status = Ended;
+                    return;
+                }
+            } else if (writen == 0) {
+                // EOF encountered
+                status->req_status = Ended;
+                return;
+            } else {
+                left -= writen;
+            }
+        }
+
+        if (left == 0) {
+            status->req_status = Ended;
+        } else {
+            status->left = left;
+        }
     }
-
-    request_t req_info;
-    if (parse_request(header, &req_info) < 0) {
-        send_response(connfd, ISE, content_500, strlen(content_500));
-        return 1;
-    }
-
-    free(header);
-    free(status);
-
-    req_info.connfd = connfd;
-    handle_request(&req_info);
-
-    close(connfd);
-    return 1;
 }
 
 void *thread(void *args) {
@@ -208,7 +256,7 @@ void *thread(void *args) {
 
                     setnonblocking(connfd);
 
-                    ev.events = EPOLLIN | EPOLLET;
+                    ev.events = EPOLLIN | EPOLLET | EPOLLONESHOT;
 
                     http_status_t *status = (http_status_t *)malloc(sizeof(http_status_t));
                     char *header = (char *)malloc(MAX_HEADER);
@@ -219,6 +267,7 @@ void *thread(void *args) {
                     status->header = header;
                     status->connfd = connfd;
                     status->readn = 0;
+                    status->req_status = Reading;
                     ev.data.ptr = status;
 
                     if (epoll_ctl(epollfd, EPOLL_CTL_ADD, connfd, &ev) < 0) {
@@ -229,6 +278,32 @@ void *thread(void *args) {
             } else {
                 http_status_t *status = (http_status_t *)events[n].data.ptr;
                 server(status);
+                if (status->req_status == Reading) {
+                    ev.events = EPOLLIN | EPOLLET | EPOLLONESHOT;
+                    ev.data.ptr = status;
+                    if (epoll_ctl(epollfd, EPOLL_CTL_MOD, status->connfd, &ev) < 0) {
+                        perror("epoll_ctl");
+                        continue;
+                    }
+                } else if (status->req_status == Writing) {
+                    ev.events = EPOLLOUT | EPOLLET | EPOLLONESHOT;
+                    ev.data.ptr = status;
+                    if (epoll_ctl(epollfd, EPOLL_CTL_MOD, status->connfd, &ev) < 0) {
+                        perror("epoll_ctl");
+                        continue;
+                    }
+                } else if (status->req_status == Ended) {
+                    if (status->file != NULL) {
+                        fclose(status->file);
+                        status->file = NULL;
+                    }
+                    if (status->header != NULL) {
+                        free(status->header);
+                        status->header = NULL;
+                    }
+                    close(status->connfd);
+                    free(status);
+                }
             }
         }
     }
