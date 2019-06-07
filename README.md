@@ -18,6 +18,8 @@ make
 
 ## Code Design
 
+Recommend to read this [post](https://kaleid-liner.github.io/2019/06/02/epoll-web-server.html) of me.
+
 ### Concurrency
 
 Concurrency of this web server was implemented by using thread pool (Posix thread) and epoll.
